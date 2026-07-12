@@ -107,60 +107,37 @@ class BlockMaskCollator:
         """Generate masks for a batch of ``batch_size`` images.
 
         Returns a dict with keys:
-            - ``context``:      (B, N) bool – True where patch is context
-            - ``target``:       (B, N) bool – True where patch is target
-            - ``target_ctx``:   (B, N) bool – True where patch is context *around* target
+            - ``context``:       (B, N) bool – True where patch is context
+            - ``target``:        (B, N) bool – union of all target blocks
+                                 (kept for logging / compatibility)
+            - ``target_blocks``: (B, K, N) bool – one mask per target block,
+                                 where K = ``num_target_blocks``. The model
+                                 predicts each block separately (I-JEPA style).
         """
         context_masks = []
         target_masks = []
-        target_ctx_masks = []
+        target_block_masks = []
 
         for _ in range(batch_size):
             occupied = torch.zeros(self.grid_size, self.grid_size, dtype=torch.bool)
             target_mask = torch.zeros(self.total_patches, dtype=torch.bool)
-            target_ctx_mask = torch.zeros(self.total_patches, dtype=torch.bool)
+            block_masks = []
 
             for _ in range(self.num_target_blocks):
                 y0, x0, y1, x1 = self._sample_block(occupied)
                 block_mask = self._block_to_mask(y0, x0, y1, x1)
+                block_masks.append(block_mask)
                 target_mask |= block_mask
 
-            # Context = everything not in target
+            # Context = everything not in any target block
             context_mask = ~target_mask
-
-            # For each target block, build a surrounding context block
-            target_indices = target_mask.nonzero(as_tuple=False).squeeze(1)
-            if target_indices.numel() > 0:
-                target_grid_y = target_indices // self.grid_size
-                target_grid_x = target_indices % self.grid_size
-                t_y0 = target_grid_y.min().item()
-                t_x0 = target_grid_x.min().item()
-                t_y1 = target_grid_y.max().item() + 1
-                t_x1 = target_grid_x.max().item() + 1
-
-                th = t_y1 - t_y0
-                tw = t_x1 - t_x0
-                ch = max(self.grid_size, int(th * self.context_scale))
-                cw = max(self.grid_size, int(tw * self.context_scale))
-
-                cy0 = max(0, t_y0 - (ch - th) // 2)
-                cx0 = max(0, t_x0 - (cw - tw) // 2)
-                cy1 = min(self.grid_size, cy0 + ch)
-                cx1 = min(self.grid_size, cx0 + cw)
-                cy0 = max(0, cy1 - ch)
-                cx0 = max(0, cx1 - cw)
-
-                ctx_idx = torch.arange(self.total_patches).reshape(self.grid_size, self.grid_size)
-                target_ctx_mask[ctx_idx[cy0:cy1, cx0:cx1].flatten()] = True
-                # Context-around-target should not include target itself
-                target_ctx_mask &= ~target_mask
 
             context_masks.append(context_mask)
             target_masks.append(target_mask)
-            target_ctx_masks.append(target_ctx_mask)
+            target_block_masks.append(torch.stack(block_masks))  # (K, N)
 
         return {
             "context": torch.stack(context_masks).to(device),
             "target": torch.stack(target_masks).to(device),
-            "target_ctx": torch.stack(target_ctx_masks).to(device),
+            "target_blocks": torch.stack(target_block_masks).to(device),
         }

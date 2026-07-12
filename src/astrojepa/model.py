@@ -219,14 +219,21 @@ class ViTEncoder(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
+        def init_fn(m):
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, mean=0.0, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, LayerNorm):
+                nn.init.ones_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+        self.apply(init_fn)
+        # Re-apply the special inits set in __init__ (apply() only touches submodules)
         nn.init.normal_(self.pos_embed, mean=0.0, std=0.02)
         if self.cls_token is not None:
             nn.init.normal_(self.cls_token, mean=0.0, std=0.02)
-        for p in self.parameters():
-            if p.dim() >= 2:
-                nn.init.normal_(p, mean=0.0, std=0.02)
-            else:
-                nn.init.zeros_(p)
 
     def forward(
         self,
@@ -300,13 +307,19 @@ class Predictor(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
+        def init_fn(m):
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, mean=0.0, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, LayerNorm):
+                nn.init.ones_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+        self.apply(init_fn)
         nn.init.normal_(self.query_tokens, mean=0.0, std=0.02)
         nn.init.normal_(self.pos_embed, mean=0.0, std=0.02)
-        for p in self.parameters():
-            if p.dim() >= 2:
-                nn.init.normal_(p, mean=0.0, std=0.02)
-            else:
-                nn.init.zeros_(p)
 
     def forward(self, context_embeds: torch.Tensor) -> torch.Tensor:
         """Predict target embeddings from context.
@@ -381,14 +394,15 @@ class JEPA(nn.Module):
         for p in self.target_encoder.parameters():
             p.requires_grad = False
 
-        # Predictor
+        # Predictor: one query token per target block (I-JEPA style)
+        self.num_target_blocks = config.num_target_blocks
         self.predictor = Predictor(
             n_embd=config.predictor_n_embd,
             n_head=config.predictor_n_head,
             n_layer=config.predictor_n_layer,
             bias=config.bias,
             dropout=config.dropout,
-            num_queries=config.predictor_num_queries,
+            num_queries=config.num_target_blocks,
             out_dim=config.n_embd,
         )
         # Project context encoder output to predictor dimension if they differ
@@ -422,9 +436,18 @@ class JEPA(nn.Module):
     ) -> dict[str, torch.Tensor]:
         """Forward pass.
 
+        Implements I-JEPA style block-wise prediction: each of the
+        ``num_target_blocks`` masked blocks is predicted separately by its own
+        predictor query token, and the loss is averaged over blocks. This
+        prevents the predictor from collapsing to a constant (which would happen
+        if a single global-mean target were predicted).
+
         Args:
             patches: (B, N, P) patch tokens.
-            masks:   dict with 'context' and 'target' bool masks.
+            masks:   dict with:
+                      'context'      (B, N) bool – True where patch is context
+                      'target_blocks' (B, K, N) bool – per-block target masks
+                      (optionally 'target' (B, N) union, used for logging only)
 
         Returns:
             dict with 'loss', 'pred', 'target', optionally 'vicreg_loss'.
@@ -435,8 +458,9 @@ class JEPA(nn.Module):
         B, N, P = patches.shape
         device = patches.device
 
-        context_mask = masks["context"]  # (B, N)
-        target_mask = masks["target"]    # (B, N)
+        context_mask = masks["context"]          # (B, N)
+        target_blocks = masks["target_blocks"]   # (B, K, N)
+        K = target_blocks.size(1)
 
         # --- Context encoder: zero out non-context patches, run ViT ---
         ctx_embeds = self.context_encoder(patches, mask=context_mask)
@@ -448,40 +472,37 @@ class JEPA(nn.Module):
             tgt_embeds = self.target_encoder(patches, mask=None)
         # (B, N+1, C) if cls_token, else (B, N, C)
 
-        # --- Predictor: predict target embeddings from context ---
-        pred_embeds = self.predictor(ctx_embeds)
-        # (B, num_queries, C)
+        # --- Predictor: one prediction per target block (query token k -> block k) ---
+        pred_embeds = self.predictor(ctx_embeds)  # (B, K, C)
+        assert pred_embeds.size(1) == K, (
+            f"predictor produced {pred_embeds.size(1)} queries but {K} target blocks"
+        )
 
-        # --- Gather target embeddings for target patches ---
+        # --- Gather per-block target embeddings from the target encoder ---
         if self.config.use_cls_token:
-            tgt_embeds_no_cls = tgt_embeds[:, 1:, :]
+            tgt_no_cls = tgt_embeds[:, 1:, :]  # (B, N, C)
         else:
-            tgt_embeds_no_cls = tgt_embeds
+            tgt_no_cls = tgt_embeds
 
-        # Mean of target patch embeddings per sample
-        target_repr = []
-        for b in range(B):
-            tgt = tgt_embeds_no_cls[b, target_mask[b]]
-            if tgt.size(0) == 0:
-                tgt = torch.zeros(1, self.config.n_embd, device=device, dtype=tgt_embeds.dtype)
-            target_repr.append(tgt.mean(dim=0, keepdim=True))
-        target_repr = torch.cat(target_repr, dim=0)  # (B, C)
+        mask_f = target_blocks.unsqueeze(-1).to(tgt_no_cls.dtype)  # (B, K, N, 1)
+        weighted = (mask_f * tgt_no_cls.unsqueeze(1)).sum(dim=2)   # (B, K, C)
+        counts = target_blocks.sum(dim=2, keepdim=True).clamp(min=1).to(tgt_no_cls.dtype)  # (B, K, 1)
+        target_block_repr = weighted / counts                     # (B, K, C)
 
-        # --- Loss: L2 between predicted and target ---
-        pred_repr = pred_embeds.mean(dim=1)  # (B, C)
-        loss = F.mse_loss(pred_repr, target_repr)
+        # --- Loss: mean over blocks of per-block MSE ---
+        per_block = ((pred_embeds - target_block_repr) ** 2).mean(dim=2)  # (B, K)
+        valid = target_blocks.sum(dim=2) > 0                              # (B, K)
+        loss = (per_block * valid).sum() / valid.sum().clamp(min=1)
 
-        # --- Optional VICReg regularizer on context embeddings ---
+        # --- Optional VICReg regularizer on the predictor outputs ---
         vicreg_loss = None
         if self.config.use_vicreg:
-            ctx_no_cls = ctx_embeds[:, 1:] if self.config.use_cls_token else ctx_embeds
-            B_vis, N_vis, C_emb = ctx_no_cls.shape
-            ctx_centered = ctx_no_cls - ctx_no_cls.mean(dim=(0, 1), keepdim=True)
-            ctx_flat = ctx_centered.reshape(-1, C_emb)
-            std = ctx_flat.std(dim=0, unbiased=False)
+            pred_flat = pred_embeds.reshape(-1, pred_embeds.size(-1))  # (B*K, C)
+            pred_centered = pred_flat - pred_flat.mean(dim=0, keepdim=True)
+            std = pred_flat.std(dim=0, unbiased=False)
             std_loss = F.relu(1 - std).mean()
-            cov = (ctx_flat.T @ ctx_flat) / max(ctx_flat.size(0) - 1, 1)
-            cov_loss = cov.fill_diagonal_(0).pow(2).sum() / C_emb
+            cov = (pred_centered.T @ pred_centered) / max(pred_flat.size(0) - 1, 1)
+            cov_loss = cov.fill_diagonal_(0).pow(2).sum() / pred_flat.size(1)
             vicreg_loss = (
                 self.config.vicreg_lambda * loss
                 + self.config.vicreg_mu * std_loss
@@ -490,8 +511,8 @@ class JEPA(nn.Module):
 
         return {
             "loss": vicreg_loss if vicreg_loss is not None else loss,
-            "pred": pred_repr,
-            "target": target_repr,
+            "pred": pred_embeds.mean(dim=1),       # (B, C) for logging
+            "target": target_block_repr.mean(dim=1),  # (B, C) for logging
             "vicreg_loss": vicreg_loss,
         }
 

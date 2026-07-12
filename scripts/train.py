@@ -47,12 +47,16 @@ def get_lr(it: int, config: dict) -> float:
 
 
 def ema_momentum_schedule(it: int, config: dict) -> float:
-    """Linearly increase EMA momentum from base to 1.0 over warmup."""
+    """Linearly ramp EMA momentum from base toward ema_max over warmup, then hold.
+
+    Never reaches 1.0 (which would freeze the target encoder).
+    """
     base = config.get("ema_momentum", 0.996)
+    ema_max = config.get("ema_max", 0.999)
     warmup = config.get("ema_warmup_iters", 2000)
     if it >= warmup:
-        return 1.0
-    return base + (1.0 - base) * it / warmup
+        return ema_max
+    return base + (ema_max - base) * it / warmup
 
 
 def estimate_loss(
