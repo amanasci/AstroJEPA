@@ -82,7 +82,7 @@ astronomy tasks.
 
 ```bash
 # Clone the repository
-git clone https://github.com/<yourname>/AstroJEPA.git
+git clone https://github.com/amanasci/AstroJEPA.git
 cd AstroJEPA
 
 # Install with uv (recommended)
