@@ -32,7 +32,7 @@ ema_warmup_iters = 100
 
 batch_size = 2
 gradient_accumulation_steps = 1
-max_iters = 2
+max_iters = 5
 warmup_iters = 10
 lr_decay_iters = 100
 decay_lr = True
@@ -45,7 +45,7 @@ num_checkpoints = 0
 checkpoint_schedule = "log"
 
 out_dir = "logs/smoke_test"
-device = "cuda"
+device = "cpu"
 dtype = "bfloat16"
 compile = False
 num_workers = 0

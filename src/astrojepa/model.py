@@ -11,8 +11,8 @@ References:
     - V-JEPA: Bardes et al., 2024 (arXiv:2404.08471)
 """
 
-import math
 import copy
+import math
 from dataclasses import dataclass
 
 import torch
@@ -239,7 +239,6 @@ class ViTEncoder(nn.Module):
         self,
         x: torch.Tensor,
         mask: torch.Tensor | None = None,
-        attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Encode patches.
 
@@ -247,7 +246,6 @@ class ViTEncoder(nn.Module):
             x: (B, N, P) patch tokens where N = num_patches, P = patch_size**2 * in_chans.
             mask: (B, N) bool – True for patches to keep (used to zero out masked patches).
                   If None, all patches are used.
-            attn_mask: optional attention mask for the transformer blocks.
 
         Returns:
             (B, M, C) embeddings where M = num_patches (+1 for cls if used).
@@ -264,6 +262,15 @@ class ViTEncoder(nn.Module):
 
         x = x + self.pos_embed[:, :x.size(1), :]
         x = self.drop(x)
+
+        attn_mask = None
+        if mask is not None:
+            if self.cls_token is not None:
+                cls_mask = torch.ones(B, 1, dtype=torch.bool, device=mask.device)
+                attn_mask = torch.cat([cls_mask, mask], dim=1)
+            else:
+                attn_mask = mask
+            attn_mask = attn_mask.view(B, 1, 1, -1)
 
         for block in self.blocks:
             x = block(x, attn_mask=attn_mask)
@@ -321,21 +328,28 @@ class Predictor(nn.Module):
         nn.init.normal_(self.query_tokens, mean=0.0, std=0.02)
         nn.init.normal_(self.pos_embed, mean=0.0, std=0.02)
 
-    def forward(self, context_embeds: torch.Tensor) -> torch.Tensor:
+    def forward(self, context_embeds: torch.Tensor, target_pos_embeds: torch.Tensor | None = None, cross_attn_mask: torch.Tensor | None = None) -> torch.Tensor:
         """Predict target embeddings from context.
 
         Args:
             context_embeds: (B, N_ctx, C) context encoder output.
+            target_pos_embeds: (B, num_queries, C) position embeddings for each target block.
+            cross_attn_mask: (B, 1, 1, N_ctx) mask for cross attention
 
         Returns:
             (B, num_queries, out_dim) predicted target embeddings.
         """
         B = context_embeds.size(0)
-        queries = self.query_tokens.expand(B, -1, -1) + self.pos_embed
+        queries = self.query_tokens.expand(B, -1, -1)
+        if target_pos_embeds is not None:
+            queries = queries + target_pos_embeds
+        else:
+            queries = queries + self.pos_embed
+
         x = self.drop(queries)
 
         for block in self.blocks:
-            x = block(x, kv=context_embeds)
+            x = block(x, kv=context_embeds, cross_attn_mask=cross_attn_mask)
 
         x = self.ln_f(x)
         x = self.out_proj(x)
@@ -414,7 +428,7 @@ class JEPA(nn.Module):
         if self.master_process:
             total_params = sum(p.numel() for p in self.parameters())
             trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
-            print(f"JEPA model initialized:")
+            print("JEPA model initialized:")
             print(f"  Total params: {total_params / 1e6:.2f}M")
             print(f"  Trainable:    {trainable / 1e6:.2f}M")
             print(f"  ContextEncoder layers: {config.n_layer}")
@@ -456,7 +470,7 @@ class JEPA(nn.Module):
             raise ValueError("masks must be provided for JEPA forward pass")
 
         B, N, P = patches.shape
-        device = patches.device
+
 
         context_mask = masks["context"]          # (B, N)
         target_blocks = masks["target_blocks"]   # (B, K, N)
@@ -467,13 +481,35 @@ class JEPA(nn.Module):
         # (B, N+1, C) if cls_token, else (B, N, C)
         ctx_embeds = self.ctx_proj(ctx_embeds)
 
+        # Build cross attention mask for predictor
+        if self.config.use_cls_token:
+            cls_mask = torch.ones(B, 1, dtype=torch.bool, device=context_mask.device)
+            cross_attn_mask = torch.cat([cls_mask, context_mask], dim=1)
+        else:
+            cross_attn_mask = context_mask
+        cross_attn_mask = cross_attn_mask.view(B, 1, 1, -1)
+
         # --- Target encoder: ALL patches (no mask), frozen ---
         with torch.no_grad():
             tgt_embeds = self.target_encoder(patches, mask=None)
         # (B, N+1, C) if cls_token, else (B, N, C)
 
+        # --- Target pos embeds ---
+        pos_embed = self.context_encoder.pos_embed
+        if self.config.use_cls_token:
+            patch_pos = pos_embed[:, 1:, :] # (1, N, C)
+        else:
+            patch_pos = pos_embed # (1, N, C)
+
+        # target_blocks is (B, K, N) bool
+        mask_f = target_blocks.unsqueeze(-1).to(patch_pos.dtype)  # (B, K, N, 1)
+        weighted_pos = (mask_f * patch_pos.unsqueeze(0)).sum(dim=2) # (B, K, C)
+        counts = target_blocks.sum(dim=2, keepdim=True).clamp(min=1).to(patch_pos.dtype)  # (B, K, 1)
+        target_pos_embeds = weighted_pos / counts # (B, K, C)
+        target_pos_embeds = self.ctx_proj(target_pos_embeds)
+
         # --- Predictor: one prediction per target block (query token k -> block k) ---
-        pred_embeds = self.predictor(ctx_embeds)  # (B, K, C)
+        pred_embeds = self.predictor(ctx_embeds, target_pos_embeds=target_pos_embeds, cross_attn_mask=cross_attn_mask)  # (B, K, C)
         assert pred_embeds.size(1) == K, (
             f"predictor produced {pred_embeds.size(1)} queries but {K} target blocks"
         )

@@ -1,3 +1,6 @@
+import datasets
+import pyarrow as pa
+pa.set_io_thread_count(1)
 """
 Unified pretraining script for AstroJEPA.
 
@@ -423,3 +426,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+    import os
+    os._exit(0)
