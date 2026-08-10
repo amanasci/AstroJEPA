@@ -59,7 +59,7 @@ class MLP(nn.Module):
         return x
 
 
-class CausalSelfAttention(nn.Module):
+class SelfAttention(nn.Module):
     def __init__(self, n_embd: int, n_head: int, bias: bool = True, dropout: float = 0.0):
         super().__init__()
         assert n_embd % n_head == 0
@@ -80,6 +80,8 @@ class CausalSelfAttention(nn.Module):
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
 
         if self.flash:
+            if attn_mask is not None and attn_mask.dtype == torch.bool:
+                attn_mask = attn_mask.unsqueeze(1)
             y = F.scaled_dot_product_attention(
                 q, k, v,
                 attn_mask=attn_mask,
@@ -89,13 +91,20 @@ class CausalSelfAttention(nn.Module):
         else:
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
             if attn_mask is not None:
-                att = att.masked_fill(attn_mask == 0, float("-inf"))
+                if attn_mask.dtype == torch.bool:
+                    att = att.masked_fill(~attn_mask.unsqueeze(1), float("-inf"))
+                else:
+                    att = att.masked_fill(attn_mask.unsqueeze(1) == 0, float("-inf"))
             att = F.softmax(att, dim=-1)
+            att = torch.nan_to_num(att, nan=0.0)
             att = self.attn_dropout(att)
             y = att @ v
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.resid_dropout(self.c_proj(y))
         return y
+
+
+CausalSelfAttention = SelfAttention
 
 
 class CrossAttention(nn.Module):
@@ -123,17 +132,27 @@ class CrossAttention(nn.Module):
         v = self.v_proj(kv).view(B_k, T_k, self.n_head, C // self.n_head).transpose(1, 2)
 
         if self.flash:
+            eff_mask = None
+            if attn_mask is not None:
+                if attn_mask.dtype == torch.bool:
+                    eff_mask = attn_mask.unsqueeze(1)
+                else:
+                    eff_mask = attn_mask.unsqueeze(1)
             y = F.scaled_dot_product_attention(
                 q, k, v,
-                attn_mask=attn_mask,
+                attn_mask=eff_mask,
                 dropout_p=self.dropout if self.training else 0,
                 is_causal=False,
             )
         else:
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
             if attn_mask is not None:
-                att = att.masked_fill(attn_mask == 0, float("-inf"))
+                if attn_mask.dtype == torch.bool:
+                    att = att.masked_fill(~attn_mask.unsqueeze(1), float("-inf"))
+                else:
+                    att = att.masked_fill(attn_mask.unsqueeze(1) == 0, float("-inf"))
             att = F.softmax(att, dim=-1)
+            att = torch.nan_to_num(att, nan=0.0)
             att = self.attn_dropout(att)
             y = att @ v
         y = y.transpose(1, 2).contiguous().view(B_q, T_q, C)
@@ -145,7 +164,7 @@ class TransformerBlock(nn.Module):
     def __init__(self, n_embd: int, n_head: int, bias: bool = True, dropout: float = 0.0):
         super().__init__()
         self.ln1 = LayerNorm(n_embd, bias=bias)
-        self.attn = CausalSelfAttention(n_embd, n_head, bias=bias, dropout=dropout)
+        self.attn = SelfAttention(n_embd, n_head, bias=bias, dropout=dropout)
         self.ln2 = LayerNorm(n_embd, bias=bias)
         self.mlp = MLP(n_embd, bias=bias, dropout=dropout)
 
@@ -161,7 +180,7 @@ class CrossAttnBlock(nn.Module):
     def __init__(self, n_embd: int, n_head: int, bias: bool = True, dropout: float = 0.0):
         super().__init__()
         self.ln1 = LayerNorm(n_embd, bias=bias)
-        self.self_attn = CausalSelfAttention(n_embd, n_head, bias=bias, dropout=dropout)
+        self.self_attn = SelfAttention(n_embd, n_head, bias=bias, dropout=dropout)
         self.ln2 = LayerNorm(n_embd, bias=bias)
         self.cross_attn = CrossAttention(n_embd, n_head, bias=bias, dropout=dropout)
         self.ln3 = LayerNorm(n_embd, bias=bias)
@@ -181,7 +200,14 @@ class CrossAttnBlock(nn.Module):
 
 
 class ViTEncoder(nn.Module):
-    """Vision Transformer encoder used for Context and Target encoders."""
+    """Vision Transformer encoder used for Context and Target encoders.
+
+    When ``mask`` is provided the encoder drops masked patches entirely
+    (I-JEPA) instead of zeroing them: only patches where ``mask==True``
+    are kept and their positional embeddings are gathered accordingly.
+    Batches with varying keep-counts are padded to ``max_keep`` and an
+    attention mask is applied so padded positions do not contribute.
+    """
 
     def __init__(
         self,
@@ -201,6 +227,7 @@ class ViTEncoder(nn.Module):
         self.use_cls_token = use_cls_token
 
         self.num_patches = (img_size // patch_size) ** 2
+        self.grid_size = img_size // patch_size
         patch_dim = in_chans * patch_size * patch_size
 
         self.patch_embed = nn.Linear(patch_dim, n_embd, bias=bias)
@@ -230,7 +257,6 @@ class ViTEncoder(nn.Module):
                     nn.init.zeros_(m.bias)
 
         self.apply(init_fn)
-        # Re-apply the special inits set in __init__ (apply() only touches submodules)
         nn.init.normal_(self.pos_embed, mean=0.0, std=0.02)
         if self.cls_token is not None:
             nn.init.normal_(self.cls_token, mean=0.0, std=0.02)
@@ -245,37 +271,82 @@ class ViTEncoder(nn.Module):
 
         Args:
             x: (B, N, P) patch tokens where N = num_patches, P = patch_size**2 * in_chans.
-            mask: (B, N) bool – True for patches to keep (used to zero out masked patches).
-                  If None, all patches are used.
-            attn_mask: optional attention mask for the transformer blocks.
+            mask: (B, N) bool — True for patches to keep. When provided the
+                  encoder drops masked patches (gather) and batches are padded
+                  to the batch-max keep-count with an attention mask. ``None``
+                  keeps all patches.
+            attn_mask: optional attention mask broadcast to ``(B, T, T)``.
 
         Returns:
-            (B, M, C) embeddings where M = num_patches (+1 for cls if used).
+            (B, M, C) embeddings. When ``mask`` is given ``M`` is
+            ``1 + max_keep`` (or ``max_keep`` without CLS); when ``mask``
+            is ``None`` ``M`` is ``num_patches (+1)``. Padded positions are
+            zeroed after the final norm and masked from attention.
         """
         B, N, P = x.shape
         x = self.patch_embed(x)  # (B, N, C)
 
-        if mask is not None:
-            x = x * mask.unsqueeze(-1).to(x.dtype)
+        if mask is None:
+            if self.cls_token is not None:
+                cls_tokens = self.cls_token.expand(B, -1, -1)
+                x = torch.cat([cls_tokens, x], dim=1)
+            x = x + self.pos_embed[:, :x.size(1), :]
+            x = self.drop(x)
+            for block in self.blocks:
+                x = block(x, attn_mask=attn_mask)
+            x = self.ln_f(x)
+            return x
+
+        mask = mask.to(torch.bool)
+        patch_pos = self.pos_embed[:, (1 if self.use_cls_token else 0):, :]  # (1, N, C)
+
+        keep_counts = mask.sum(dim=1)
+        max_keep = int(keep_counts.max().item())
+        if max_keep == 0:
+            max_keep = 1
+
+        gathered = x.new_zeros(B, max_keep, self.n_embd)
+        gathered_pos = x.new_zeros(B, max_keep, self.n_embd)
+        keep_mask = torch.zeros(B, max_keep, dtype=torch.bool, device=x.device)
+        for b in range(B):
+            idx = torch.where(mask[b])[0]
+            k = int(idx.numel())
+            if k > 0:
+                gathered[b, :k] = x[b, idx]
+                gathered_pos[b, :k] = patch_pos[0, idx]
+                keep_mask[b, :k] = True
 
         if self.cls_token is not None:
             cls_tokens = self.cls_token.expand(B, -1, -1)
-            x = torch.cat([cls_tokens, x], dim=1)
+            cls_pos = self.pos_embed[:, 0:1, :].expand(B, -1, -1)
+            gathered = torch.cat([cls_tokens, gathered], dim=1)  # (B, 1+max_keep, C)
+            gathered_pos = torch.cat([cls_pos, gathered_pos], dim=1)
+            keep_mask = torch.cat([torch.ones(B, 1, dtype=torch.bool, device=x.device), keep_mask], dim=1)
 
-        x = x + self.pos_embed[:, :x.size(1), :]
+        x = gathered + gathered_pos
         x = self.drop(x)
 
+        pad_attn_mask = keep_mask[:, None, :] & keep_mask[:, :, None]  # (B, T, T) bool
+        if attn_mask is not None:
+            if attn_mask.dtype == torch.bool:
+                pad_attn_mask = pad_attn_mask & attn_mask
+            else:
+                pad_attn_mask = pad_attn_mask & (attn_mask != 0)
         for block in self.blocks:
-            x = block(x, attn_mask=attn_mask)
+            x = block(x, attn_mask=pad_attn_mask)
 
         x = self.ln_f(x)
+        x = x * keep_mask.unsqueeze(-1).to(x.dtype)
         return x
 
 
 class Predictor(nn.Module):
     """Predictor network that predicts target embeddings from context embeddings.
 
-    Uses cross-attention: learnable query tokens attend to context embeddings.
+    I-JEPA style: a shared mask token plus a 2-D positional table. For each
+    target block we average the positional embeddings of the patches inside the
+    block to obtain a *position-conditioned* query, then cross-attend into the
+    context embeddings. This makes the predictor spatially aware.
     """
 
     def __init__(
@@ -287,13 +358,23 @@ class Predictor(nn.Module):
         dropout: float = 0.0,
         num_queries: int = 16,
         out_dim: int | None = None,
+        num_patches: int | None = None,
+        grid_size: int | None = None,
     ):
         super().__init__()
         self.num_queries = num_queries
         self.n_embd = n_embd
         self.out_dim = out_dim if out_dim is not None else n_embd
+        if num_patches is None and grid_size is not None:
+            num_patches = grid_size * grid_size
+        if num_patches is None:
+            num_patches = 1024
+        self.num_patches = num_patches
+        self.grid_size = grid_size
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, n_embd))
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, n_embd))
         self.query_tokens = nn.Parameter(torch.zeros(1, num_queries, n_embd))
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_queries, n_embd))
+        self.query_pos = nn.Parameter(torch.zeros(1, num_queries, n_embd))
         self.drop = nn.Dropout(dropout)
         self.blocks = nn.ModuleList([
             CrossAttnBlock(n_embd, n_head, bias=bias, dropout=dropout)
@@ -318,24 +399,65 @@ class Predictor(nn.Module):
                     nn.init.zeros_(m.bias)
 
         self.apply(init_fn)
-        nn.init.normal_(self.query_tokens, mean=0.0, std=0.02)
+        nn.init.normal_(self.mask_token, mean=0.0, std=0.02)
         nn.init.normal_(self.pos_embed, mean=0.0, std=0.02)
+        nn.init.normal_(self.query_tokens, mean=0.0, std=0.02)
+        nn.init.normal_(self.query_pos, mean=0.0, std=0.02)
 
-    def forward(self, context_embeds: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        context_embeds: torch.Tensor,
+        target_blocks: torch.Tensor | None = None,
+        context_keep_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Predict target embeddings from context.
 
         Args:
-            context_embeds: (B, N_ctx, C) context encoder output.
+            context_embeds: (B, T_ctx, C) context encoder output (may be padded).
+            target_blocks: (B, K, N) bool target-block masks. When provided
+                queries are position-conditioned via the averaged 2-D pos
+                embed inside each block (I-JEPA). When ``None`` falls back to
+                the fixed learnable queries for backward compatibility.
+            context_keep_mask: (B, T_ctx) bool — True for valid (non-padded)
+                context tokens. Used to mask padded KVs from cross-attention.
 
         Returns:
-            (B, num_queries, out_dim) predicted target embeddings.
+            (B, K, out_dim) predicted target embeddings.
         """
         B = context_embeds.size(0)
-        queries = self.query_tokens.expand(B, -1, -1) + self.pos_embed
+        if target_blocks is not None:
+            K = target_blocks.size(1)
+            N = target_blocks.size(2)
+            if N != self.num_patches:
+                counts = target_blocks.sum(dim=2, keepdim=True).clamp(min=1).to(context_embeds.dtype)
+                pos_expanded = self.pos_embed[:, :N, :].expand(B, -1, -1)  # (B,N,C)
+                mask_f = target_blocks.unsqueeze(-1).to(context_embeds.dtype)  # (B,K,N,1)
+                weighted = (mask_f * pos_expanded.unsqueeze(1)).sum(dim=2)  # (B,K,C)
+                block_pos = weighted / counts  # (B,K,C)
+            else:
+                counts = target_blocks.sum(dim=2, keepdim=True).clamp(min=1).to(context_embeds.dtype)
+                pos_expanded = self.pos_embed.expand(B, -1, -1)  # (B,N,C)
+                mask_f = target_blocks.unsqueeze(-1).to(context_embeds.dtype)  # (B,K,N,1)
+                weighted = (mask_f * pos_expanded.unsqueeze(1)).sum(dim=2)  # (B,K,C)
+                block_pos = weighted / counts  # (B,K,C)
+            queries = self.mask_token.expand(B, K, -1) + block_pos
+        else:
+            K = self.num_queries
+            queries = self.query_tokens.expand(B, -1, -1) + self.query_pos
         x = self.drop(queries)
 
+        cross_mask: torch.Tensor | None = None
+        if context_keep_mask is not None:
+            Bk, Tk = context_embeds.size(0), context_embeds.size(1)
+            if context_keep_mask.size(1) != Tk:
+                padded = torch.zeros(Bk, Tk, dtype=torch.bool, device=context_embeds.device)
+                valid = min(context_keep_mask.size(1), Tk)
+                padded[:, :valid] = context_keep_mask[:, :valid]
+                context_keep_mask = padded
+            cross_mask = context_keep_mask.unsqueeze(1).expand(B, K, Tk)  # (B,K,Tk) bool, True=keep
+
         for block in self.blocks:
-            x = block(x, kv=context_embeds)
+            x = block(x, kv=context_embeds, cross_attn_mask=cross_mask)
 
         x = self.ln_f(x)
         x = self.out_proj(x)
@@ -394,8 +516,9 @@ class JEPA(nn.Module):
         for p in self.target_encoder.parameters():
             p.requires_grad = False
 
-        # Predictor: one query token per target block (I-JEPA style)
         self.num_target_blocks = config.num_target_blocks
+        self.grid_size = config.img_size // config.patch_size
+        self.num_patches = self.grid_size * self.grid_size
         self.predictor = Predictor(
             n_embd=config.predictor_n_embd,
             n_head=config.predictor_n_head,
@@ -404,8 +527,9 @@ class JEPA(nn.Module):
             dropout=config.dropout,
             num_queries=config.num_target_blocks,
             out_dim=config.n_embd,
+            num_patches=self.num_patches,
+            grid_size=self.grid_size,
         )
-        # Project context encoder output to predictor dimension if they differ
         if config.n_embd != config.predictor_n_embd:
             self.ctx_proj = nn.Linear(config.n_embd, config.predictor_n_embd, bias=False)
         else:
@@ -462,18 +586,18 @@ class JEPA(nn.Module):
         target_blocks = masks["target_blocks"]   # (B, K, N)
         K = target_blocks.size(1)
 
-        # --- Context encoder: zero out non-context patches, run ViT ---
-        ctx_embeds = self.context_encoder(patches, mask=context_mask)
-        # (B, N+1, C) if cls_token, else (B, N, C)
+        ctx_embeds = self.context_encoder(patches, mask=context_mask)  # (B, T_ctx, C) padded
+        T_ctx = ctx_embeds.size(1)
+        ctx_keep = torch.zeros(B, T_ctx, dtype=torch.bool, device=ctx_embeds.device)
+        for b in range(B):
+            k = int(context_mask[b].sum().item()) + (1 if self.config.use_cls_token else 0)
+            ctx_keep[b, : min(k, T_ctx)] = True
         ctx_embeds = self.ctx_proj(ctx_embeds)
 
-        # --- Target encoder: ALL patches (no mask), frozen ---
         with torch.no_grad():
             tgt_embeds = self.target_encoder(patches, mask=None)
-        # (B, N+1, C) if cls_token, else (B, N, C)
 
-        # --- Predictor: one prediction per target block (query token k -> block k) ---
-        pred_embeds = self.predictor(ctx_embeds)  # (B, K, C)
+        pred_embeds = self.predictor(ctx_embeds, target_blocks=target_blocks, context_keep_mask=ctx_keep)
         assert pred_embeds.size(1) == K, (
             f"predictor produced {pred_embeds.size(1)} queries but {K} target blocks"
         )

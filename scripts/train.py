@@ -129,7 +129,8 @@ def save_checkpoint(
     config: dict,
 ):
     """Save model checkpoint."""
-    raw_model = model.module if isinstance(model, DDP) else model
+    unwrapped = model.module if isinstance(model, DDP) else model
+    raw_model = getattr(unwrapped, "_orig_mod", unwrapped)
     checkpoint = {
         "model": raw_model.state_dict(),
         "optimizer": optimizer.state_dict(),
@@ -215,6 +216,7 @@ def main():
         max_target_block_size=config["max_target_block_size"],
         context_scale=config["context_scale"],
         grid_size=grid_size,
+        seed=1337 + ddp_rank,
     )
 
     train_dataset = GalaxyStreamDataset(
@@ -291,15 +293,17 @@ def main():
     iter_num = 0
     best_val_loss = float("inf")
 
-    # Compile
     if config.get("compile", True):
         if master_process:
             print("compiling model...")
         model = torch.compile(model)
 
-    # DDP
     if ddp:
         model = DDP(model, device_ids=[ddp_local_rank])
+
+    def _raw_model(m):
+        unwrapped = m.module if isinstance(m, DDP) else m
+        return getattr(unwrapped, "_orig_mod", unwrapped)
 
     # Resume
     if args.resume:
@@ -314,7 +318,7 @@ def main():
             iter_num = ckpt["iter_num"]
             best_val_loss = ckpt["best_val_loss"]
 
-    raw_model = model.module if ddp else model
+    raw_model = _raw_model(model)
 
     if master_process:
         print(f"starting training from iter {iter_num}")
@@ -379,7 +383,7 @@ def main():
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
                 ema_m = ema_momentum_schedule(iter_num, config)
-                model.update_target_encoder(m=ema_m)
+                _raw_model(model).update_target_encoder(m=ema_m)
             if master_process:
                 print(f"stream exhausted at iter {iter_num}; stopping")
                 save_checkpoint(model, optimizer, iter_num, best_val_loss, config["out_dir"], config)
@@ -393,9 +397,8 @@ def main():
         scaler.update()
         optimizer.zero_grad(set_to_none=True)
 
-        # Update target encoder EMA
         ema_m = ema_momentum_schedule(iter_num, config)
-        model.update_target_encoder(m=ema_m)
+        _raw_model(model).update_target_encoder(m=ema_m)
 
         # Logging
         t1 = time.time()

@@ -1,0 +1,1 @@
+- Prefers model size labels (e.g., 001M/070M/300M) to reflect trainable parameter count excluding the frozen EMA TargetEncoder duplicate, and wants configs resized via n_embd/n_layer/predictor dims to hit the labeled trainable size rather than relabeling, with documentation reporting both trainable and total (incl. EMA) for transparency. Confidence: 0.92

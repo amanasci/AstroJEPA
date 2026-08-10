@@ -165,13 +165,13 @@ EMA copy of the Context Encoder and is not trained directly, so the listed
 *Total* includes it, while the trainable parameter count equals that of the
 Context Encoder + Predictor.
 
-| Model | Context / Target Encoder | Predictor | Total |
-|-------|--------------------------|-----------|-------|
-| 001M | 3L, 128C, 2H  | 2L, 64C, 2H   | ~1M   |
-| 005M | 5L, 192C, 3H  | 2L, 96C, 3H   | ~5M   |
-| 021M | 5L, 384C, 6H  | 3L, 192C, 4H  | ~21M  |
-| 070M | 10L, 512C, 8H | 3L, 320C, 5H  | ~70M  |
-| 300M | 11L, 1024C, 16H | 5L, 512C, 8H | ~300M |
+| Model | Context / Target Encoder | Predictor | Trainable | Total (incl. EMA) |
+|-------|--------------------------|-----------|-----------|-------------------|
+| 001M | 3L, 128C, 2H  | 2L, 64C, 2H   | ~1.0M  | ~1.9M  |
+| 005M | 5L, 256C, 4H  | 2L, 128C, 4H  | ~5.1M  | ~9.5M  |
+| 021M | 5L, 512C, 8H  | 3L, 256C, 4H  | ~20M   | ~37M   |
+| 070M | 8L, 768C, 12H | 4L, 384C, 6H  | ~68M   | ~126M  |
+| 300M | 13L, 1280C, 16H | 5L, 640C, 8H | ~293M | ~551M |
 
 *L = layers, C = embedding dimension, H = attention heads.*
 
