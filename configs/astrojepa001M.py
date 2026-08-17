@@ -61,7 +61,7 @@ eval_iters = 50
 log_interval = 50
 
 # Checkpoint
-num_checkpoints = 3
+num_checkpoints = 64
 checkpoint_schedule = "log"
 checkpoint_interval = 0
 

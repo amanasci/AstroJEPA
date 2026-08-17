@@ -38,7 +38,7 @@ from astrojepa.model import JEPA, JEPAConfig
 def get_lr(it: int, config: dict) -> float:
     """Cosine LR schedule with linear warmup."""
     if it < config["warmup_iters"]:
-        return config["learning_rate"] * it / config["warmup_iters"]
+        return config["learning_rate"] * (it + 1) / config["warmup_iters"]
     if it > config["lr_decay_iters"]:
         return config["min_lr"]
     decay_ratio = (it - config["warmup_iters"]) / (config["lr_decay_iters"] - config["warmup_iters"])

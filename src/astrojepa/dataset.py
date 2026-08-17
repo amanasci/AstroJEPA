@@ -13,6 +13,7 @@ import functools
 import math
 import os
 import random
+import time
 from typing import Callable, Optional
 
 import einops
@@ -86,20 +87,48 @@ class GalaxyStreamDataset(IterableDataset):
         self.streaming = streaming
         self.max_samples = max_samples
 
-        from datasets import load_dataset
-        self._dataset = load_dataset(
-            "Smith42/galaxies",
-            revision=revision,
-            split=split,
-            streaming=streaming,
-        )
+        last_err = None
+        for attempt in range(5):
+            try:
+                from datasets import load_dataset
+                self._dataset = load_dataset(
+                    "Smith42/galaxies",
+                    revision=revision,
+                    split=split,
+                    streaming=streaming,
+                )
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                if attempt == 4:
+                    raise
+                delay = min(30.0, (1.0 * (2 ** attempt)) + random.uniform(0, 1.0))
+                time.sleep(delay)
+        if last_err is not None:
+            raise last_err
 
     def __iter__(self):
-        """Yield processed galaxy patches."""
+        """Yield processed galaxy patches with retry on transient HF errors."""
         count = 0
-        for sample in self._dataset:
+        failures = 0
+        max_failures = 10
+        dataset_iter = iter(self._dataset)
+        while True:
             if self.max_samples is not None and count >= self.max_samples:
                 break
+            try:
+                sample = next(dataset_iter)
+                failures = 0
+            except StopIteration:
+                break
+            except Exception as e:
+                failures += 1
+                if failures > max_failures:
+                    raise RuntimeError(f"GalaxyStreamDataset: too many consecutive streaming failures ({failures})") from e
+                delay = min(60.0, (1.0 * (2 ** (failures - 1))) + random.uniform(0, 1.0))
+                time.sleep(delay)
+                continue
             try:
                 img = np.array(sample["image"]).swapaxes(0, 2)  # (H, W, C) -> (C, H, W)
                 img = torch.from_numpy(img).float()
@@ -137,7 +166,7 @@ def _collate_galaxy(batch: list[dict], patch_size: int) -> dict[str, torch.Tenso
 class StreamingDataLoader:
     """Wrapper around PyTorch DataLoader with HF streaming support.
 
-    Handles DDP sharding and buffered shuffle.
+    Handles DDP sharding and buffered shuffle with retry on transient failures.
     """
 
     def __init__(
@@ -191,11 +220,26 @@ class StreamingDataLoader:
         return self
 
     def __next__(self) -> dict[str, torch.Tensor]:
-        """Fetch and process next batch.
-
-        Returns dict with 'patches', 'masks', 'context_mask', 'target_mask'.
-        """
-        batch = next(self._iterator)
+        """Fetch and process next batch with retry on transient streaming errors."""
+        max_retries = 5
+        batch = None
+        for attempt in range(max_retries + 1):
+            try:
+                batch = next(self._iterator)
+                break
+            except StopIteration:
+                raise
+            except Exception as e:
+                if attempt == max_retries:
+                    raise RuntimeError(f"StreamingDataLoader: failed after {max_retries} retries") from e
+                delay = min(30.0, (1.0 * (2 ** attempt)) + random.uniform(0, 0.5))
+                time.sleep(delay)
+                try:
+                    self._iterator = iter(self._loader)
+                except Exception:
+                    pass
+                continue
+        assert batch is not None
         B = batch["images"].size(0)
 
         # Generate masks on CPU, move to device
@@ -211,8 +255,16 @@ class StreamingDataLoader:
         }
 
     def reset(self) -> None:
-        """Reset the underlying DataLoader iterator."""
-        self._iterator = iter(self._loader)
+        """Reset the underlying DataLoader iterator with retry."""
+        for attempt in range(5):
+            try:
+                self._iterator = iter(self._loader)
+                break
+            except Exception as e:
+                if attempt == 4:
+                    raise
+                delay = min(10.0, (0.5 * (2 ** attempt)) + random.uniform(0, 0.5))
+                time.sleep(delay)
 
     def __len__(self) -> int:
         return len(self._loader)
